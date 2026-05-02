@@ -44,9 +44,10 @@ def get_db():
 
 
 def init_db():
-    """Create tables if they don't exist."""
+    """Create tables if they don't exist and enable WAL mode."""
     with get_db() as conn:
         cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -200,17 +201,6 @@ def delete_event(chat_id: int, event_id: int) -> bool:
         return cursor.rowcount > 0
 
 
-def get_anniversary_date(chat_id: int) -> Optional[str]:
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT event_date FROM events WHERE chat_id = ? AND name LIKE 'Anniversary%' LIMIT 1",
-            (chat_id,),
-        )
-        row = cursor.fetchone()
-        return row["event_date"] if row else None
-
-
 # ── Notes ───────────────────────────────────────────────
 
 def add_note(chat_id: int, title: str, content: str, photo_id: Optional[str] = None) -> int:
@@ -321,10 +311,14 @@ def set_journey_event(chat_id: int, event_name: str):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO user_settings (chat_id, timezone, journey_event) VALUES (?, 'UTC', ?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET journey_event = excluded.journey_event",
-            (chat_id, event_name),
+            "UPDATE user_settings SET journey_event = ? WHERE chat_id = ?",
+            (event_name, chat_id),
         )
+        if cursor.rowcount == 0:
+            cursor.execute(
+                "INSERT INTO user_settings (chat_id, timezone, journey_event) VALUES (?, 'UTC', ?)",
+                (chat_id, event_name),
+            )
         conn.commit()
 
 

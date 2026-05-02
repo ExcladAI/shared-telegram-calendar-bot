@@ -123,6 +123,17 @@ def build_confirm_delete_inline(item_type: str, item_id: int) -> InlineKeyboardM
     ])
 
 
+def build_pagination_nav(page: int, total: int, prefix: str) -> list[list[InlineKeyboardButton]]:
+    """Return a navigation row for paginated lists."""
+    row = []
+    if page > 1:
+        row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"pg|{prefix}|{page - 1}"))
+    row.append(InlineKeyboardButton(f"{page}/{total}", callback_data="pg_noop"))
+    if page < total:
+        row.append(InlineKeyboardButton("Next ▶️", callback_data=f"pg|{prefix}|{page + 1}"))
+    return [row] if row else []
+
+
 def build_edit_field_inline(item_type: str, item_id: int) -> InlineKeyboardMarkup:
     if item_type == "event":
         buttons = [

@@ -85,8 +85,12 @@ async def _check_single_event(application, row, utc_now, last_check):
     except pytz.UnknownTimeZoneError:
         user_tz = pytz.utc
 
-    # Parse notify time
-    notify_hour, notify_min = map(int, notify_time.split(":"))
+    # Parse notify time (validated on input, but guard against malformed data)
+    try:
+        notify_hour, notify_min = map(int, notify_time.split(":"))
+    except (ValueError, AttributeError):
+        logger.warning("Malformed notify_time '%s' for event '%s' in chat %s", notify_time, name, chat_id)
+        return
     user_now = utc_now.astimezone(user_tz)
     user_last = last_check.astimezone(user_tz)
 

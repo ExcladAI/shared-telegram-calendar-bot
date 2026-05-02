@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from functools import wraps
 
 import pytz
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     ContextTypes,
@@ -42,7 +42,6 @@ from db import (
     get_event,
     update_event,
     delete_event,
-    get_anniversary_date,
     add_note,
     get_notes,
     get_note,
@@ -66,6 +65,7 @@ from keyboard import (
     build_note_list_inline,
     build_confirm_delete_inline,
     build_edit_field_inline,
+    build_pagination_nav,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,8 @@ def restricted(func):
             logger.warning("Unauthorized access attempt from user %s", user_id)
             if update.message:
                 await update.message.reply_text("⛔️ Sorry, this is a private bot.")
+            elif update.callback_query:
+                await update.callback_query.answer("⛔️ Sorry, this is a private bot.", show_alert=True)
             return
         return await func(update, context, *args, **kwargs)
 
@@ -131,6 +133,35 @@ def calculate_elapsed(start_date: datetime, today: datetime) -> tuple:
         months += 12
 
     return years, months, days
+
+
+PER_PAGE = 5
+
+
+def _validate_field_value(field: str, value: str) -> str | None:
+    """Validate a field value for edit/create. Returns error message or None."""
+    if field == "Date":
+        try:
+            datetime.strptime(value, "%d-%m-%Y")
+        except ValueError:
+            return "Invalid Date Format. Use DD-MM-YYYY."
+    elif field == "Time":
+        try:
+            datetime.strptime(value, "%H:%M")
+        except ValueError:
+            return "Invalid Time Format. Use HH:MM."
+    return None
+
+
+def _is_passed_one_time(ev: dict) -> bool:
+    """Check if a one-time event has already passed."""
+    if ev.get("recurring"):
+        return False
+    try:
+        ev_date = datetime.strptime(ev["event_date"], "%d-%m-%Y").date()
+        return ev_date < datetime.now().date()
+    except ValueError:
+        return False
 
 
 # ── Basic commands ──────────────────────────────────────
@@ -242,10 +273,23 @@ async def save_journey_event(update: Update, context: ContextTypes.DEFAULT_TYPE)
     event_name = update.message.text.strip()
     chat_id = update.effective_chat.id
 
-    set_journey_event(chat_id, event_name)
+    # Validate an event with this name exists
+    events = get_events(chat_id)
+    match = next((e for e in events if e["name"].lower() == event_name.lower()), None)
+    if not match:
+        event_list = ", ".join(f"**{e['name']}**" for e in events) if events else "(none)"
+        await update.message.reply_text(
+            f"❌ No event named **{secure_text(event_name)}** found.\n\n"
+            f"Your events: {event_list}\n\nTry again or press Back.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_back_keyboard(),
+        )
+        return JOURNEY_EVENT_STATE
+
+    set_journey_event(chat_id, match["name"])
 
     await update.message.reply_text(
-        f"✅ Journey event set to **{secure_text(event_name)}**.",
+        f"✅ Journey event set to **{secure_text(match['name'])}**.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=get_main_keyboard(),
     )
@@ -402,74 +446,110 @@ async def get_note_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── List Events ─────────────────────────────────────────
 
-@restricted
-async def list_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    events = get_events(update.effective_chat.id)
-    user_tz = get_timezone(update.effective_chat.id)
+def _build_event_page(chat_id: int, user_tz: str, page: int) -> tuple[str, int, list[dict]]:
+    """Build paginated event list. Returns (message, total_pages, page_events)."""
+    all_events = get_events(chat_id)
+    # Filter passed one-time events
+    active = [e for e in all_events if not _is_passed_one_time(e)]
+    total = max(1, (len(active) + PER_PAGE - 1) // PER_PAGE)
+    page = min(page, total)
+    start = (page - 1) * PER_PAGE
+    page_events = active[start:start + PER_PAGE]
 
-    if not events:
-        await update.message.reply_text(
-            "No dates saved yet!", reply_markup=get_main_keyboard()
-        )
-        return
-
-    message = (
+    msg = (
         f"\U0001f4c5 <b>Your Important Dates:</b>\n"
-        f"(Timezone: {user_tz})\n\n"
+        f"(Timezone: {user_tz}) Page {page}/{total}\n\n"
     )
-    for ev in events:
+    for ev in page_events:
         label = "♻️" if ev.get("recurring") else "1️⃣"
-        message += (
+        msg += (
             f"{label} <b>{secure_text(ev['name'])}</b>: "
             f"{ev['event_date']} at {ev['notify_time']}\n"
         )
+    if len(all_events) > len(active):
+        msg += "\n_(Passed one-time events hidden)_"
+    return msg, total, page_events
 
-    inline_kb = build_event_list_inline(events)
 
-    await update.message.reply_text(
-        message,
-        parse_mode=ParseMode.HTML,
-        reply_markup=inline_kb if inline_kb else get_main_keyboard(),
+@restricted
+async def list_events(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
+    chat_id = update.effective_chat.id
+    user_tz = get_timezone(chat_id)
+    msg, total, page_events = _build_event_page(chat_id, user_tz, page)
+
+    if not page_events and page == 1:
+        await update.message.reply_text(
+            "No active dates saved yet!", reply_markup=get_main_keyboard()
+        )
+        return
+
+    item_kb = build_event_list_inline(page_events)
+    nav_rows = build_pagination_nav(page, total, "ev")
+    keyboard = InlineKeyboardMarkup(
+        (item_kb.inline_keyboard if item_kb else []) + nav_rows
     )
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+@restricted
+async def page_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback: navigate event list pages."""
+    query = update.callback_query
+    await query.answer()
+    target_page = int(query.data.split("|")[2])
+    chat_id = update.effective_chat.id
+    user_tz = get_timezone(chat_id)
+    msg, total, page_events = _build_event_page(chat_id, user_tz, target_page)
+
+    item_kb = build_event_list_inline(page_events)
+    nav_rows = build_pagination_nav(target_page, total, "ev")
+    keyboard = InlineKeyboardMarkup(
+        (item_kb.inline_keyboard if item_kb else []) + nav_rows
+    )
+    await query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 # ── List Notes ──────────────────────────────────────────
 
-@restricted
-async def list_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    notes = get_notes(update.effective_chat.id)
+def _build_note_page(chat_id: int, page: int) -> tuple[str, int, list[dict]]:
+    """Build paginated text-note list. Returns (message, total_pages, page_notes)."""
+    all_notes = get_notes(chat_id)
+    text_notes = [n for n in all_notes if not n["photo_id"]]
+    total = max(1, (len(text_notes) + PER_PAGE - 1) // PER_PAGE)
+    page = min(page, total)
+    start = (page - 1) * PER_PAGE
+    page_notes = text_notes[start:start + PER_PAGE]
 
-    if not notes:
+    msg = f"\U0001f4dd <b>Your Saved Notes:</b> Page {page}/{total}\n\n"
+    for note in page_notes:
+        msg += f"\U0001f4cc <b>{secure_text(note['title'])}</b>\n"
+        if note["content"]:
+            msg += f"<code>{secure_text(note['content'])}</code>\n\n"
+    return msg, total, page_notes
+
+
+@restricted
+async def list_notes(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
+    chat_id = update.effective_chat.id
+    all_notes = get_notes(chat_id)
+    image_notes = [n for n in all_notes if n["photo_id"]]
+
+    if not all_notes:
         await update.message.reply_text(
             "No notes saved yet!", reply_markup=get_main_keyboard()
         )
         return
 
-    text_notes_message = "\U0001f4dd <b>Your Saved Notes:</b>\n\n"
-    image_notes = []
-    has_text_notes = False
+    # Text notes — paginated
+    msg, total, page_notes = _build_note_page(chat_id, page)
+    inline_kb = build_note_list_inline(page_notes)
+    nav_rows = build_pagination_nav(page, total, "nt")
+    keyboard = InlineKeyboardMarkup(
+        (inline_kb.inline_keyboard if inline_kb else []) + nav_rows
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-    for note in notes:
-        if note["photo_id"]:
-            image_notes.append(note)
-        else:
-            has_text_notes = True
-            text_notes_message += f"\U0001f4cc <b>{secure_text(note['title'])}</b>\n"
-            if note["content"]:
-                text_notes_message += f"<code>{secure_text(note['content'])}</code>\n\n"
-
-    if has_text_notes:
-        inline_kb = build_note_list_inline([
-            n for n in notes if not n["photo_id"]
-        ])
-        await update.message.reply_text(
-            text_notes_message,
-            parse_mode=ParseMode.HTML,
-            reply_markup=inline_kb,
-        )
-    elif not image_notes:
-        await update.message.reply_text("No text notes found.")
-
+    # Photo notes — shown non-paginated at the end
     for note in image_notes:
         caption = f"\U0001f4cc <b>{secure_text(note['title'])}</b>"
         if note["content"]:
@@ -477,6 +557,23 @@ async def list_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_photo(
             photo=note["photo_id"], caption=caption, parse_mode=ParseMode.HTML
         )
+
+
+@restricted
+async def page_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback: navigate note list pages."""
+    query = update.callback_query
+    await query.answer()
+    target_page = int(query.data.split("|")[2])
+    chat_id = update.effective_chat.id
+    msg, total, page_notes = _build_note_page(chat_id, target_page)
+
+    inline_kb = build_note_list_inline(page_notes)
+    nav_rows = build_pagination_nav(target_page, total, "nt")
+    keyboard = InlineKeyboardMarkup(
+        (inline_kb.inline_keyboard if inline_kb else []) + nav_rows
+    )
+    await query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 # ── Upcoming ────────────────────────────────────────────
@@ -553,7 +650,7 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if n["content"]:
                 msg += f": {secure_text(n['content'])}"
             if n["photo_id"]:
-                msg += " [photo]"
+                msg += " [photo — view in Telegram to see]"
             msg += "\n"
     else:
         msg += "(none)\n"
@@ -618,6 +715,17 @@ async def delete_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item_id = int(text)
         delete_type = context.user_data.get("delete_type")
 
+        # Confirmation step: if not yet confirmed, ask
+        if context.user_data.get("delete_confirm_id") != item_id:
+            context.user_data["delete_confirm_id"] = item_id
+            label = "date" if delete_type == "event" else "note"
+            await update.message.reply_text(
+                f"Delete {label} #{item_id}? Type the ID again to confirm, or Back to cancel.",
+                reply_markup=get_back_keyboard(),
+            )
+            return DELETE_CHOICE
+
+        # Confirmed — perform delete
         if delete_type == "event":
             ok = delete_event(update.effective_chat.id, item_id)
         else:
@@ -644,6 +752,7 @@ async def delete_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Inline Delete callbacks ─────────────────────────────
 
+@restricted
 async def inline_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show confirmation inline when user presses [Del] on a list item."""
     query = update.callback_query
@@ -659,6 +768,7 @@ async def inline_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+@restricted
 async def inline_delete_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Execute the delete after user confirms."""
     query = update.callback_query
@@ -680,6 +790,7 @@ async def inline_delete_execute(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Could not delete. Item may already be gone.")
 
 
+@restricted
 async def inline_delete_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel a pending inline delete."""
     query = update.callback_query
@@ -689,6 +800,7 @@ async def inline_delete_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ── Inline Edit callbacks ───────────────────────────────
 
+@restricted
 async def inline_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry: user pressed [Edit] on a list item. Show field selection."""
     query = update.callback_query
@@ -733,6 +845,7 @@ async def inline_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return INLINE_AWAIT_FIELD
 
 
+@restricted
 async def inline_field_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User selected a field to edit. Prompt for new value."""
     query = update.callback_query
@@ -760,6 +873,7 @@ async def inline_field_select(update: Update, context: ContextTypes.DEFAULT_TYPE
     return INLINE_AWAIT_VALUE
 
 
+@restricted
 async def inline_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Capture the new value and save the edit."""
     field = context.user_data["inline_edit_field"]
@@ -774,24 +888,10 @@ async def inline_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         new_value = update.message.text or ""
         if item_type == "event":
-            if field == "Date":
-                try:
-                    datetime.strptime(new_value, "%d-%m-%Y")
-                except ValueError:
-                    await update.message.reply_text(
-                        "Invalid Date Format. Use DD-MM-YYYY.",
-                        reply_markup=get_back_keyboard(),
-                    )
-                    return INLINE_AWAIT_VALUE
-            elif field == "Time":
-                try:
-                    datetime.strptime(new_value, "%H:%M")
-                except ValueError:
-                    await update.message.reply_text(
-                        "Invalid Time Format. Use HH:MM.",
-                        reply_markup=get_back_keyboard(),
-                    )
-                    return INLINE_AWAIT_VALUE
+            error = _validate_field_value(field, new_value)
+            if error:
+                await update.message.reply_text(error, reply_markup=get_back_keyboard())
+                return INLINE_AWAIT_VALUE
             update_event(chat_id, item_id, field, new_value)
         else:
             update_note(chat_id, item_id, field, new_value)
@@ -804,6 +904,7 @@ async def inline_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+@restricted
 async def inline_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -933,31 +1034,11 @@ async def edit_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if context.user_data["edit_type"] == "event":
-        if field == "Name":
-            pass
-        elif field == "Date":
-            try:
-                datetime.strptime(new_value, "%d-%m-%Y")
-            except ValueError:
-                await update.message.reply_text(
-                    "Invalid Date Format. Use DD-MM-YYYY.",
-                    reply_markup=get_back_keyboard(),
-                )
-                return EDIT_NEW_VALUE
-        elif field == "Time":
-            try:
-                datetime.strptime(new_value, "%H:%M")
-            except ValueError:
-                await update.message.reply_text(
-                    "Invalid Time Format. Use HH:MM.",
-                    reply_markup=get_back_keyboard(),
-                )
-                return EDIT_NEW_VALUE
-        elif field == "Recurring":
-            pass  # update_event handles the conversion
-
+        error = _validate_field_value(field, new_value)
+        if error:
+            await update.message.reply_text(error, reply_markup=get_back_keyboard())
+            return EDIT_NEW_VALUE
         update_event(chat_id, item_id, field, new_value)
-
     else:  # note
         if field == "Content" and update.message.photo:
             photo_id = update.message.photo[-1].file_id
@@ -967,7 +1048,6 @@ async def edit_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "✅ Note updated successfully!", reply_markup=get_main_keyboard()
             )
             return ConversationHandler.END
-
         update_note(chat_id, item_id, field, new_value)
 
     await update.message.reply_text(
@@ -1022,6 +1102,13 @@ def register_handlers(application):
     application.add_handler(CallbackQueryHandler(inline_delete_confirm, pattern=r"^del\|"))
     application.add_handler(CallbackQueryHandler(inline_delete_execute, pattern=r"^confirm_del\|"))
     application.add_handler(CallbackQueryHandler(inline_delete_cancel, pattern=r"^cancel_del$"))
+
+    # Pagination callbacks
+    application.add_handler(CallbackQueryHandler(page_events, pattern=r"^pg\|ev\|"))
+    application.add_handler(CallbackQueryHandler(page_notes, pattern=r"^pg\|nt\|"))
+    application.add_handler(CallbackQueryHandler(
+        lambda u, c: u.callback_query.answer(), pattern=r"^pg_noop$"
+    ))
 
     # Inline edit conversation
     application.add_handler(ConversationHandler(
