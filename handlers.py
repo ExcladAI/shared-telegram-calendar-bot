@@ -3,10 +3,11 @@
 import calendar
 import html
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 from functools import wraps
 
-import pytz
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
+
 from telegram import Update, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -154,12 +155,12 @@ def _validate_field_value(field: str, value: str) -> str | None:
 
 
 def _is_passed_one_time(ev: dict) -> bool:
-    """Check if a one-time event has already passed."""
+    """Check if a one-time event has already passed (uses UTC for consistency)."""
     if ev.get("recurring"):
         return False
     try:
         ev_date = datetime.strptime(ev["event_date"], "%d-%m-%Y").date()
-        return ev_date < datetime.now().date()
+        return ev_date < datetime.now(dt_timezone.utc).date()
     except ValueError:
         return False
 
@@ -227,26 +228,26 @@ async def our_journey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not date_str:
         await update.message.reply_text(
             "\U0001f494 I don't know when you started!\n\n"
-            f"Please add an event named **{event_name}** so I can calculate your time together.\n\n"
+            f"Please add an event named <b>{secure_text(event_name)}</b> so I can calculate your time together.\n\n"
             "You can change which event to use with ⚙️ Journey Event.",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         return
 
     try:
         start_date = datetime.strptime(date_str, "%d-%m-%Y")
-        today = datetime.now()
+        today = datetime.now(dt_timezone.utc)
         years, months, days = calculate_elapsed(start_date, today)
         total_days = (today - start_date).days
 
         msg = (
-            f"❤️ **Our Journey Together** ❤️\n\n"
-            f"Since **{date_str}**\n"
+            f"❤️ <b>Our Journey Together</b> ❤️\n\n"
+            f"Since <b>{date_str}</b>\n"
             f"We have been together for:\n"
-            f"**{years}** Years, **{months}** Months, and **{days}** Days.\n\n"
-            f"That is **{total_days}** days of love! \U0001f618"
+            f"<b>{years}</b> Years, <b>{months}</b> Months, and <b>{days}</b> Days.\n\n"
+            f"That is <b>{total_days}</b> days of love! \U0001f618"
         )
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
     except ValueError:
         await update.message.reply_text(
             "Error calculating date. Please check your date format."
@@ -260,10 +261,10 @@ async def journey_event_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id
     current = get_journey_event(chat_id)
     await update.message.reply_text(
-        f"⚙️ The current journey event is: **{current}**\n\n"
+        f"⚙️ The current journey event is: <b>{secure_text(current)}</b>\n\n"
         "Enter the exact name of the event you want to use for the ❤️ Our Journey calculation.\n"
         "For example, if you have an event named 'Wedding', type: Wedding",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
         reply_markup=get_back_keyboard(),
     )
     return JOURNEY_EVENT_STATE
@@ -277,11 +278,11 @@ async def save_journey_event(update: Update, context: ContextTypes.DEFAULT_TYPE)
     events = get_events(chat_id)
     match = next((e for e in events if e["name"].lower() == event_name.lower()), None)
     if not match:
-        event_list = ", ".join(f"**{e['name']}**" for e in events) if events else "(none)"
+        event_list = ", ".join(f"<b>{secure_text(e['name'])}</b>" for e in events) if events else "(none)"
         await update.message.reply_text(
-            f"❌ No event named **{secure_text(event_name)}** found.\n\n"
+            f"❌ No event named <b>{secure_text(event_name)}</b> found.\n\n"
             f"Your events: {event_list}\n\nTry again or press Back.",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
             reply_markup=get_back_keyboard(),
         )
         return JOURNEY_EVENT_STATE
@@ -289,8 +290,8 @@ async def save_journey_event(update: Update, context: ContextTypes.DEFAULT_TYPE)
     set_journey_event(chat_id, match["name"])
 
     await update.message.reply_text(
-        f"✅ Journey event set to **{secure_text(match['name'])}**.",
-        parse_mode=ParseMode.MARKDOWN,
+        f"✅ Journey event set to <b>{secure_text(match['name'])}</b>.",
+        parse_mode=ParseMode.HTML,
         reply_markup=get_main_keyboard(),
     )
     return ConversationHandler.END
@@ -313,7 +314,7 @@ async def timezone_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def save_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_tz = update.message.text.strip()
 
-    if user_tz not in pytz.all_timezones:
+    if user_tz not in available_timezones():
         await update.message.reply_text(
             "❌ Invalid Timezone.\n"
             "Please choose from the buttons or check spelling (Case Sensitive, e.g., 'Asia/Singapore').",
@@ -324,8 +325,8 @@ async def save_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_set_timezone(update.effective_chat.id, user_tz)
 
     await update.message.reply_text(
-        f"✅ Timezone set to **{user_tz}**.",
-        parse_mode=ParseMode.MARKDOWN,
+        f"✅ Timezone set to <b>{secure_text(user_tz)}</b>.",
+        parse_mode=ParseMode.HTML,
         reply_markup=get_main_keyboard(),
     )
     return ConversationHandler.END
@@ -584,9 +585,9 @@ async def upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_tz = get_timezone(update.effective_chat.id)
 
     try:
-        tz = pytz.timezone(user_tz)
-    except pytz.UnknownTimeZoneError:
-        tz = pytz.utc
+        tz = ZoneInfo(user_tz)
+    except ZoneInfoNotFoundError:
+        tz = ZoneInfo("UTC")
 
     today = datetime.now(tz).date()
     cutoff = today + timedelta(days=90)
@@ -596,6 +597,8 @@ async def upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for ev in events:
         try:
             ev_date = datetime.strptime(ev["event_date"], "%d-%m-%Y").date()
+            if not ev.get("recurring") and ev_date < today:
+                continue  # one-time event already passed
             this_year = ev_date.replace(year=today.year)
             if this_year < today:
                 this_year = ev_date.replace(year=today.year + 1)
@@ -614,13 +617,13 @@ async def upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    msg = f"🔍 **Upcoming Events** (next 3 months, {user_tz})\n\n"
+    msg = f"🔍 <b>Upcoming Events</b> (next 3 months, {user_tz})\n\n"
     for name, date_str, days in upcoming_list:
         when = f"in {days} day(s)" if days > 0 else "TODAY!"
-        msg += f"• **{secure_text(name)}** — {date_str} ({when})\n"
+        msg += f"• <b>{secure_text(name)}</b> — {date_str} ({when})\n"
 
     await update.message.reply_text(
-        msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard()
+        msg, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard()
     )
 
 
@@ -656,7 +659,7 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "(none)\n"
 
     await update.message.reply_text(
-        msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard()
+        msg, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard()
     )
 
 

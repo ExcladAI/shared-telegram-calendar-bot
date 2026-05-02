@@ -1,9 +1,12 @@
 """Database operations with connection safety, retry logic, and parameterized queries."""
 
+import logging
 import sqlite3
 import time
 from contextlib import contextmanager
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from config import DB_PATH, MAX_INPUT_LENGTH, MAX_NOTE_CONTENT_LENGTH
 
@@ -48,6 +51,7 @@ def init_db():
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA wal_autocheckpoint=1000")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,8 +106,13 @@ def migrate():
 
 
 def _truncate(value: str, max_len: int) -> str:
-    """Truncate input to max length."""
-    return value[:max_len] if value else ""
+    """Truncate input to max length, logging a warning when truncation occurs."""
+    if not value:
+        return ""
+    if len(value) > max_len:
+        logger.warning("Input truncated from %d to %d chars", len(value), max_len)
+        return value[:max_len]
+    return value
 
 
 # ── System key-value ────────────────────────────────────
@@ -180,6 +189,9 @@ def update_event(chat_id: int, event_id: int, field: str, value: str) -> bool:
     else:
         value = _truncate(value, 5)
 
+    assert column in ("name", "event_date", "notify_time", "recurring"), \
+        f"Unexpected column: {column}"
+
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -245,6 +257,9 @@ def update_note(chat_id: int, note_id: int, field: str, value: str,
         raise ValueError(f"Invalid note field: {field}")
     max_len = MAX_INPUT_LENGTH if column == "title" else MAX_NOTE_CONTENT_LENGTH
     value = _truncate(value, max_len)
+
+    assert column in ("title", "content"), f"Unexpected column: {column}"
+
     with get_db() as conn:
         cursor = conn.cursor()
         if field == "Content" and photo_id:

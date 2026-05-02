@@ -3,7 +3,8 @@
 import logging
 from datetime import datetime, timedelta, timezone as dt_timezone
 
-import pytz
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram.constants import ParseMode
 from telegram.ext import Application
@@ -81,9 +82,9 @@ async def _check_single_event(application, row, utc_now, last_check):
 
     tz_name = row["timezone"] if row["timezone"] else "UTC"
     try:
-        user_tz = pytz.timezone(tz_name)
-    except pytz.UnknownTimeZoneError:
-        user_tz = pytz.utc
+        user_tz = ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        user_tz = ZoneInfo("UTC")
 
     # Parse notify time (validated on input, but guard against malformed data)
     try:
